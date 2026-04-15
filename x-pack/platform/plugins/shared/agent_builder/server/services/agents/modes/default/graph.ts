@@ -8,6 +8,8 @@
 import { END as _END_, START as _START_, StateGraph } from '@langchain/langgraph';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import type { BaseMessage } from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
+import { z } from '@kbn/zod/v4';
 import type { Logger } from '@kbn/core/server';
 import type { InferenceChatModel } from '@kbn/inference-langchain';
 import type { ResolvedAgentCapabilities } from '@kbn/agent-builder-common';
@@ -24,7 +26,7 @@ import { convertError, isRecoverableError } from '../utils/errors';
 import type { PromptFactory } from './prompts';
 import { getRandomAnsweringMessage, getRandomThinkingMessage } from './i18n';
 import { steps, tags } from './constants';
-import type { StateType } from './state';
+import type { StateType, ComplexityTier } from './state';
 import { StateAnnotation } from './state';
 import {
   processAnswerResponse,
@@ -43,9 +45,20 @@ import {
   isToolPromptAction,
 } from './actions';
 import type { ProcessedConversation } from '../utils/prepare_conversation';
+import { getClassifyQueryPrompt } from './prompts/classify_query';
 
 // number of successive recoverable errors we try to recover from before throwing
 const MAX_ERROR_COUNT = 2;
+
+const TIER_CYCLE_LIMITS: Record<ComplexityTier, number> = {
+  simple: 3,
+  medium: 6,
+  complex: 10,
+};
+
+const tierSchema = z.object({
+  tier: z.enum(['simple', 'medium', 'complex']).describe('The query complexity tier'),
+});
 
 export const createAgentGraph = ({
   chatModel,
@@ -74,6 +87,46 @@ export const createAgentGraph = ({
     return {};
   };
 
+  const classifyQuery = async (state: StateType) => {
+    const query = processedConversation.nextInput.message;
+
+    // Signal 2: call index_explorer directly if available, to count accessible sources
+    let indexExplorerResult: string | null = null;
+    const indexExplorerTool = toolManager.list().find((t) => t.name === 'index_explorer');
+    if (indexExplorerTool) {
+      try {
+        const result = await indexExplorerTool.invoke({ limit: 5 });
+        indexExplorerResult = typeof result === 'string' ? result : JSON.stringify(result);
+      } catch (err) {
+        logger.debug(
+          `[classifyQuery] index_explorer call failed, using text-only classification: ${err}`
+        );
+      }
+    }
+
+    try {
+      const classifierWithOutput = chatModel
+        .withStructuredOutput(tierSchema, { name: 'classify_query' })
+        .withConfig({ tags: [tags.classifyAgent] });
+
+      const { tier } = await classifierWithOutput.invoke([
+        new HumanMessage(getClassifyQueryPrompt({ query, indexExplorerResult })),
+      ]);
+
+      // Cap at the current cycleLimit (the absolute max set by CYCLE_LIMIT in run_chat_agent)
+      const cycleLimit = Math.min(TIER_CYCLE_LIMITS[tier], state.cycleLimit);
+      logger.debug(`[classifyQuery] tier=${tier}, cycleLimit=${cycleLimit}`);
+
+      return { complexityTier: tier, cycleLimit };
+    } catch (err) {
+      // On failure, keep the current cycleLimit unchanged (defaults to CYCLE_LIMIT = 15)
+      logger.debug(
+        `[classifyQuery] classification failed, keeping default cycleLimit=${state.cycleLimit}: ${err}`
+      );
+      return {};
+    }
+  };
+
   const researchAgent = async (state: StateType) => {
     const researcherModel = chatModel.bindTools(toolManager.list()).withConfig({
       tags: [tags.agent, tags.researchAgent],
@@ -86,6 +139,8 @@ export const createAgentGraph = ({
       const response = await researcherModel.invoke(
         await promptFactory.getMainPrompt({
           actions: state.mainActions,
+          cycleLimit: state.cycleLimit,
+          currentCycle: state.currentCycle,
         })
       );
 
@@ -268,6 +323,7 @@ export const createAgentGraph = ({
   const graph = new StateGraph(StateAnnotation)
     // nodes
     .addNode(steps.init, init)
+    .addNode(steps.classifyQuery, classifyQuery)
     .addNode(steps.researchAgent, researchAgent)
     .addNode(steps.executeTool, executeTool)
     .addNode(steps.handleToolInterrupt, handleToolInterrupt)
@@ -276,7 +332,8 @@ export const createAgentGraph = ({
     .addNode(steps.finalize, finalize)
     // edges
     .addEdge(_START_, steps.init)
-    .addEdge(steps.init, steps.researchAgent)
+    .addEdge(steps.init, steps.classifyQuery)
+    .addEdge(steps.classifyQuery, steps.researchAgent)
     .addConditionalEdges(steps.researchAgent, researchAgentEdge, {
       [steps.researchAgent]: steps.researchAgent,
       [steps.executeTool]: steps.executeTool,

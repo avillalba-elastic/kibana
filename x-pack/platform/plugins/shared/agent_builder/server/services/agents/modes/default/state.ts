@@ -9,6 +9,8 @@ import { Annotation } from '@langchain/langgraph';
 import type { PromptRequest } from '@kbn/agent-builder-common/agents/prompts';
 import type { AnswerAgentAction, ResearchAgentAction } from './actions';
 
+export type ComplexityTier = 'simple' | 'medium' | 'complex';
+
 export const StateAnnotation = Annotation.Root({
   // inputs
   cycleLimit: Annotation<number>({
@@ -17,6 +19,10 @@ export const StateAnnotation = Annotation.Root({
   }),
   // internals
   resumeToStep: Annotation<string>(),
+  complexityTier: Annotation<ComplexityTier | null>({
+    reducer: (a, b) => b,
+    default: () => null,
+  }),
   currentCycle: Annotation<number>({
     reducer: (a, b) => b,
     default: () => 0,

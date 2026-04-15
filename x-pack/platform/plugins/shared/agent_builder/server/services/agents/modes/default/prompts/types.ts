@@ -31,6 +31,8 @@ export interface PromptFactoryParams {
 
 export interface ResearchAgentPromptRuntimeParams {
   actions: ResearchAgentAction[];
+  cycleLimit: number;
+  currentCycle: number;
 }
 
 export interface AnswerAgentPromptRuntimeParams {

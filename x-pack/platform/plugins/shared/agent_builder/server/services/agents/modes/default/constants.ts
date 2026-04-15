@@ -7,6 +7,7 @@
 
 export const steps = {
   init: 'init',
+  classifyQuery: 'classifyQuery',
   researchAgent: 'researchAgent',
   executeTool: 'executeTool',
   handleToolInterrupt: 'handleToolInterrupt',
@@ -17,6 +18,7 @@ export const steps = {
 
 export const tags = {
   agent: 'agent',
+  classifyAgent: 'classify-agent',
   researchAgent: 'research-agent',
   answerAgent: 'answer-agent',
 };
